@@ -619,6 +619,96 @@ let simplify_lets lam =
   in
   simplif lam
 
+(* Moves expressions of the form (let foo = <tailcall> in <body>) to their reference
+   position iff they are used once.
+   This allows TRMC to work with packed GADTs.
+  *)
+let rec lift_tail_calls context lambda =
+  match lambda with
+  | Lvar var ->
+      (match Ident.Map.find_opt var context with
+       | None -> lambda
+       | Some (call, used) ->
+           if !used = 0
+           then (used := !used + 1; call)
+           else lambda)
+  | Lmutvar _ -> lambda
+  | Lconst _ -> lambda
+  | Lapply ap ->
+      Lapply {ap with ap_func = lift_tail_calls context ap.ap_func;
+                     ap_args = List.map (lift_tail_calls context) ap.ap_args;
+             }
+  | Llet (k, v, ident, lambda, body)  ->
+    (let lambda = lift_tail_calls context lambda in
+    match lambda with
+    | Lapply { ap_tailcall = Tailcall_expectation true; _ } ->
+      let used = ref 0 in
+      let new_context = Ident.Map.add ident (lambda, used) context in
+      let lifted_body = lift_tail_calls new_context body in
+      (* We only lift it if there is exactly one use. If there is not,
+         this is not in the tail call position. We can undo this and
+         recursively the function, but this is already a warning. *)
+      if !used = 1
+      then lifted_body
+      else Llet (k, v, ident, lambda, body)
+    | _ -> Llet (k, v, ident, lambda, lift_tail_calls context body))
+  | Lmutlet (v, ident, lambda, body)  ->
+      (Lmutlet (v, ident, lift_tail_calls context lambda, lift_tail_calls context body))
+  | Lfunction lfun -> Lfunction (map_lfunction (lift_tail_calls context) lfun)
+  | Lletrec(bindings, body) ->
+      Lletrec (List.map (fun binding ->
+        { binding with def = map_lfunction (lift_tail_calls context) binding.def }) bindings,
+        lift_tail_calls context body)
+  | Lprim (prim, ls, loc) -> Lprim (prim, List.map (lift_tail_calls context) ls, loc)
+  | Lswitch (lambda, lambda_switch, loc) ->
+      let lambda_switch =
+        { lambda_switch with
+          sw_consts =
+        List.map (fun (n, e) ->
+          n, lift_tail_calls context e) lambda_switch.sw_consts
+        ; sw_blocks =
+        List.map (fun (n, e) ->
+          n, lift_tail_calls context e) lambda_switch.sw_blocks
+        }
+      in
+      Lswitch (lift_tail_calls context lambda, lambda_switch, loc)
+  | Lstringswitch (lambda, sw, default, loc) ->
+      let lambda = lift_tail_calls context lambda in
+      let sw =
+        List.map (fun (s, e) ->
+          s, lift_tail_calls context e) sw
+      in
+      let default = Option.map (lift_tail_calls context) default in
+      Lstringswitch (lambda, sw, default, loc)
+   | Lstaticraise (i,ls) -> Lstaticraise (i, List.map (lift_tail_calls context) ls)
+   | Lstaticcatch (l1, idents, l2) ->
+       Lstaticcatch (lift_tail_calls context l1, idents, lift_tail_calls context l2)
+    | Ltrywith (l1, v, l2) -> Ltrywith(lift_tail_calls context l1, v, lift_tail_calls context l2)
+    | Lifthenelse (l1, l2, l3) ->
+      Lifthenelse(lift_tail_calls context l1,
+                  lift_tail_calls context l2,
+                  lift_tail_calls context l3)
+    | Lsequence (l1, l2) ->
+      Lsequence(lift_tail_calls context l1,
+                lift_tail_calls context l2)
+    | Lwhile (l1, l2) ->
+      Lwhile(lift_tail_calls context l1,
+             lift_tail_calls context l2)
+    | Lfor (v, l1, l2, dir, l3) ->
+      Lfor(v, lift_tail_calls context l1,
+           lift_tail_calls context l2, dir,
+           lift_tail_calls context l3)
+    | Lassign (v, l) ->
+      Lassign(v, lift_tail_calls context l)
+    | Lsend (k, m, o, ll, loc) ->
+      Lsend(k, lift_tail_calls context m, lift_tail_calls context o, List.map (lift_tail_calls context) ll, loc)
+    | Levent (l, ev) ->
+      Levent(lift_tail_calls context l, ev)
+    | Lifused (v, l) ->
+      Lifused(v, lift_tail_calls context l)
+;;
+
+
 (* Tail call info in annotation files *)
 
 let rec emit_tail_infos is_tail lambda =
@@ -951,6 +1041,7 @@ let simplify_lambda lam =
        )
     |> simplify_exits
     |> simplify_lets
+    |> lift_tail_calls Ident.Map.empty
     |> Tmc.rewrite
   in
   if !Clflags.annotations

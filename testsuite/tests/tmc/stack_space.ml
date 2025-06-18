@@ -47,3 +47,31 @@ module TreeMap = struct
        (* large right-leaning tree *)
     |> map succ
 end
+
+module ListWithSizeOfList = struct
+  type ('a, 'size) t =
+    | Nil : ('a, unit) t
+    | Cons : 'a * ('a, 'size) t -> ('a, unit * 'size) t
+
+  type 'a packed = T : ('a, 'size) t -> 'a packed [@@unboxed]
+
+  let[@tail_mod_cons] rec of_list = function
+    | [] -> T Nil
+    | x :: xs ->
+        let T t = (of_list[@tailcall]) xs in
+        T (Cons (x, t))
+
+  let[@tail_mod_cons] rec of_list_match = function
+    | [] -> T Nil
+    | x :: xs ->
+        match (of_list_match[@tailcall]) xs with
+        | T t -> T (Cons (x, t))
+
+  let _ =
+    init large Fun.id
+    |> of_list
+
+  let _ =
+    init large Fun.id
+    |> of_list_match
+end
